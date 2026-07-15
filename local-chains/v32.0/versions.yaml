@@ -1,5 +1,5 @@
 general:
-  protocol_version: "v31.0"
+  protocol_version: "v32.0"
   variant: "atomic-interop (IMT bundle model)"
   genesis_root: "0x1a1bcd12720224a96cac4b34c9ee0942bf3afe48fcf8932c28476bd47ec84959"
 
