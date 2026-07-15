@@ -5,6 +5,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use backon::{ConstantBuilder, Retryable};
+use std::sync::Arc;
 use std::time::Duration;
 use zksync_os_batch_types::{CommittedBatchInfo, DiscoveredCommittedBatch};
 use zksync_os_contract_interface::IExecutor::ReportCommittedBatchRangeZKsyncOS;
@@ -12,7 +13,6 @@ use zksync_os_contract_interface::calldata::CommitCalldata;
 use zksync_os_contract_interface::models::CommitBatchInfo;
 use zksync_os_contract_interface::{Bridgehub, IExecutor, MessageRoot, ZkChain};
 use zksync_os_provider::NodeProvider;
-use std::sync::Arc;
 
 /// Retry policy for data that can transiently lag right after a commit is observed on a
 /// load-balanced RPC.

@@ -209,11 +209,8 @@ impl<RpcStorage: ReadRpcStorage> ZksNamespace<RpcStorage> {
                     .await
                     .context("batch_tree_proof (L1)")?;
 
-                    let chain_proof_vector = chain_proof_vector(
-                        execute_sl_block_number,
-                        chain_log_proof,
-                        l1_chain_id,
-                    );
+                    let chain_proof_vector =
+                        chain_proof_vector(execute_sl_block_number, chain_log_proof, l1_chain_id);
 
                     batch_chain_proof.extend(chain_proof_vector);
 
