@@ -1,7 +1,5 @@
 use crate::imt::{ImtLeaf as EngineImtLeaf, IndexedMerkleTree, calculate_root, indexed_leaf_hash};
-use crate::log_proof_utils::{
-    L2_MESSAGE_ROOT_ADDRESS, batch_tree_proof, chain_proof_vector, get_chain_log_proof,
-};
+use crate::log_proof_utils::{batch_tree_proof, chain_proof_vector, get_chain_log_proof};
 use crate::result::ToRpcResult;
 use crate::{EthCallHandler, ReadRpcStorage};
 use alloy::eips::BlockId;
@@ -13,7 +11,6 @@ use alloy::sol_types::SolCall;
 use anyhow::Context;
 use async_trait::async_trait;
 use blake2::{Blake2s256, Digest};
-use futures::{FutureExt, TryFutureExt};
 use jsonrpsee::core::RpcResult;
 use ruint::aliases::B160;
 use std::sync::Arc;
@@ -29,7 +26,7 @@ use zksync_os_rpc_api::{
     },
     zks::ZksApiServer,
 };
-use zksync_os_storage_api::{PersistedBatch, RepositoryError, StateError, read_multichain_root};
+use zksync_os_storage_api::{RepositoryError, StateError, read_multichain_root};
 use zksync_os_types::L2_TO_L1_TREE_SIZE;
 
 const LOG_PROOF_SUPPORTED_METADATA_VERSION: u8 = 1;
@@ -58,7 +55,6 @@ pub struct ZksNamespace<RpcStorage> {
     storage: RpcStorage,
     genesis_input_source: Arc<dyn GenesisInputSource>,
     l2_chain_id: u64,
-    gateway_provider: Option<DynProvider>,
     /// L1 provider, used (among other things) to build the L1 MessageRoot
     /// aggregation hop for proofs of L1-settled chains.
     l1_provider: DynProvider,
@@ -75,7 +71,6 @@ impl<RpcStorage> ZksNamespace<RpcStorage> {
         storage: RpcStorage,
         genesis_input_source: Arc<dyn GenesisInputSource>,
         l2_chain_id: u64,
-        gateway_provider: Option<DynProvider>,
         l1_provider: DynProvider,
         eth_call_handler: EthCallHandler<RpcStorage>,
     ) -> Self {
@@ -85,7 +80,6 @@ impl<RpcStorage> ZksNamespace<RpcStorage> {
             storage,
             genesis_input_source,
             l2_chain_id,
-            gateway_provider,
             l1_provider,
             eth_call_handler,
         }
@@ -163,144 +157,8 @@ impl<RpcStorage: ReadRpcStorage> ZksNamespace<RpcStorage> {
             .chain(std::iter::once(multichain_root))
             .collect::<Vec<_>>();
 
-        let (batch_proof_len, batch_chain_proof, is_final_node, gateway_block_number) = match &self
-            .gateway_provider
-        {
-            Some(gateway_provider) => {
-                let execute_sl_block_number = batch
-                    .execute_sl_block_number
-                    .ok_or(ZksError::BatchNotAvailableYet)?;
-
-                match proof_target {
-                    LogProofTarget::L1BatchRoot => {
-                        let gateway_batch: PersistedBatch = gateway_provider
-                            .raw_request(
-                                "unstable_getBatchByBlockNumber".into(),
-                                (execute_sl_block_number,),
-                            )
-                            .await
-                            .context("unstable_getBatchByBlockNumber")?;
-                        let gateway_batch_number = gateway_batch.number();
-
-                        // "batch" and "chain" parts can be fetched in parallel, so we prepare futures and join them at the end.
-                        let chain_log_proof_future = get_chain_log_proof(
-                            self.l2_chain_id,
-                            gateway_batch.last_block_number(),
-                            gateway_provider,
-                            L2_MESSAGE_ROOT_ADDRESS,
-                        )
-                        .map_err(|e| e.context("get_chain_log_proof"));
-
-                        let gw_local_root_future = gateway_provider
-                            .raw_request("unstable_getLocalRoot".into(), (gateway_batch_number,))
-                            .map_err(|e| anyhow::Error::from(e).context("unstable_getLocalRoot"));
-
-                        let gw_chain_id_future = gateway_provider
-                            .get_chain_id()
-                            .map_err(|e| anyhow::Error::from(e).context("get_chain_id"));
-
-                        let chain_proof_vector_future = futures::future::try_join3(
-                            chain_log_proof_future,
-                            gw_local_root_future,
-                            gw_chain_id_future,
-                        )
-                        .map_ok(
-                            |(mut chain_log_proof, gw_local_root, gw_chain_id)| {
-                                // Chain tree is the right subtree of the aggregated tree.
-                                // We append root of the left subtree to form full proof.
-                                chain_log_proof.chain_id_leaf_proof_mask |=
-                                    U256::from(1u64 << chain_log_proof.chain_id_leaf_proof.len());
-                                chain_log_proof.chain_id_leaf_proof.push(gw_local_root);
-                                chain_proof_vector(
-                                    gateway_batch_number,
-                                    chain_log_proof,
-                                    gw_chain_id,
-                                )
-                            },
-                        );
-
-                        let batch_tree_proof_future = batch_tree_proof(
-                            gateway_batch.block_range.clone(),
-                            self.l2_chain_id,
-                            batch_number,
-                            gateway_provider,
-                            L2_MESSAGE_ROOT_ADDRESS,
-                        )
-                        .map_err(|e| e.context("batch_tree_proof"));
-
-                        let (chain_proof_vector, (mut batch_chain_proof, batch_proof_len)) =
-                            futures::future::try_join(
-                                chain_proof_vector_future.boxed(),
-                                batch_tree_proof_future.boxed(),
-                            )
-                            .await?;
-
-                        batch_chain_proof.extend(chain_proof_vector);
-
-                        (
-                            batch_proof_len,
-                            batch_chain_proof,
-                            false,
-                            Some(execute_sl_block_number),
-                        )
-                    }
-                    LogProofTarget::MessageRoot => {
-                        // For the "until msg root" format the chain proof is taken at the specific
-                        // SL block where this chain batch was executed (not at the end of the SL
-                        // L1 batch). The proof goes from the batch leaf directly to the block-level
-                        // message root, so no local-root extension is required.
-                        let chain_log_proof_future = get_chain_log_proof(
-                            self.l2_chain_id,
-                            execute_sl_block_number,
-                            gateway_provider,
-                            L2_MESSAGE_ROOT_ADDRESS,
-                        )
-                        .map_err(|e| e.context("get_chain_log_proof"));
-
-                        let gw_chain_id_future = gateway_provider
-                            .get_chain_id()
-                            .map_err(|e| anyhow::Error::from(e).context("get_chain_id"));
-
-                        let chain_proof_vector_future =
-                            futures::future::try_join(chain_log_proof_future, gw_chain_id_future)
-                                .map_ok(|(chain_log_proof, gw_chain_id)| {
-                                    chain_proof_vector(
-                                        execute_sl_block_number,
-                                        chain_log_proof,
-                                        gw_chain_id,
-                                    )
-                                });
-
-                        // The batch tree proof uses only the single execution block so that the
-                        // resulting root matches the block-level message root.
-                        let batch_tree_proof_future = batch_tree_proof(
-                            execute_sl_block_number..=execute_sl_block_number,
-                            self.l2_chain_id,
-                            batch_number,
-                            gateway_provider,
-                            L2_MESSAGE_ROOT_ADDRESS,
-                        )
-                        .map_err(|e| e.context("batch_tree_proof"));
-
-                        let (chain_proof_vector, (mut batch_chain_proof, batch_proof_len)) =
-                            futures::future::try_join(
-                                chain_proof_vector_future.boxed(),
-                                batch_tree_proof_future.boxed(),
-                            )
-                            .await?;
-
-                        batch_chain_proof.extend(chain_proof_vector);
-
-                        (
-                            batch_proof_len,
-                            batch_chain_proof,
-                            false,
-                            Some(execute_sl_block_number),
-                        )
-                    }
-                }
-            }
-            None => match proof_target {
+        let (batch_proof_len, batch_chain_proof, is_final_node, gateway_block_number) =
+            match proof_target {
                 // L1-settled chain. The interop root for this chain's batch is the GLOBAL L1
                 // MessageRoot at the L1 block where the batch was executed (commit `71bc43441`
                 // builds the interop tree on L1, keyed by (L1_CHAIN_ID, l1Block)). Build the same
@@ -310,9 +168,12 @@ impl<RpcStorage: ReadRpcStorage> ZksNamespace<RpcStorage> {
                 // chain holds (they import interopRoots[L1_CHAIN_ID][l1Block]), and the
                 // atomic-interop deadline has no settlement-layer block to compare against.
                 LogProofTarget::MessageRoot => {
-                    let execute_sl_block_number = batch
-                        .execute_sl_block_number
-                        .ok_or(ZksError::BatchNotAvailableYet)?;
+                    let execute_sl_block_number =
+                        batch.execute_sl_block_number.ok_or_else(|| {
+                            ZksError::Batch(anyhow::anyhow!(
+                                "batch {batch_number} has not been executed on L1 yet"
+                            ))
+                        })?;
 
                     // The L1 MessageRoot lives at a deployed address (unlike the canonical L2
                     // address used on a gateway); resolve it from the L1 bridgehub.
@@ -321,48 +182,38 @@ impl<RpcStorage: ReadRpcStorage> ZksNamespace<RpcStorage> {
                             .messageRoot()
                             .call()
                             .await
-                            .map_err(|e| {
-                                anyhow::Error::from(e).context("bridgehub.messageRoot()")
-                            })?;
+                            .context("bridgehub.messageRoot()")?;
 
-                    let chain_log_proof_future = get_chain_log_proof(
+                    let chain_log_proof = get_chain_log_proof(
                         self.l2_chain_id,
                         execute_sl_block_number,
                         &self.l1_provider,
                         l1_message_root_address,
                     )
-                    .map_err(|e| e.context("get_chain_log_proof (L1)"));
+                    .await
+                    .context("get_chain_log_proof (L1)")?;
 
-                    let l1_chain_id_future = self
+                    let l1_chain_id = self
                         .l1_provider
                         .get_chain_id()
-                        .map_err(|e| anyhow::Error::from(e).context("get_chain_id (L1)"));
+                        .await
+                        .context("get_chain_id (L1)")?;
 
-                    let chain_proof_vector_future =
-                        futures::future::try_join(chain_log_proof_future, l1_chain_id_future)
-                            .map_ok(|(chain_log_proof, l1_chain_id)| {
-                                chain_proof_vector(
-                                    execute_sl_block_number,
-                                    chain_log_proof,
-                                    l1_chain_id,
-                                )
-                            });
-
-                    let batch_tree_proof_future = batch_tree_proof(
+                    let (mut batch_chain_proof, batch_proof_len) = batch_tree_proof(
                         execute_sl_block_number..=execute_sl_block_number,
                         self.l2_chain_id,
                         batch_number,
                         &self.l1_provider,
                         l1_message_root_address,
                     )
-                    .map_err(|e| e.context("batch_tree_proof (L1)"));
+                    .await
+                    .context("batch_tree_proof (L1)")?;
 
-                    let (chain_proof_vector, (mut batch_chain_proof, batch_proof_len)) =
-                        futures::future::try_join(
-                            chain_proof_vector_future.boxed(),
-                            batch_tree_proof_future.boxed(),
-                        )
-                        .await?;
+                    let chain_proof_vector = chain_proof_vector(
+                        execute_sl_block_number,
+                        chain_log_proof,
+                        l1_chain_id,
+                    );
 
                     batch_chain_proof.extend(chain_proof_vector);
 
@@ -376,8 +227,7 @@ impl<RpcStorage: ReadRpcStorage> ZksNamespace<RpcStorage> {
                 // Other targets (e.g. L1 withdrawal-finalization proofs) terminate at L1 as a
                 // final node — there is no settlement layer above L1.
                 _ => (0, Vec::<B256>::new(), true, None),
-            },
-        };
+            };
 
         let proof = {
             let mut metadata = [0u8; 32];
@@ -703,13 +553,6 @@ pub type ZksResult<Ok> = Result<Ok, ZksError>;
 /// General `zks` namespace errors
 #[derive(Debug, thiserror::Error)]
 pub enum ZksError {
-    /// Block is executed according to L1 but hasn't been indexed by this node yet. Client needs to
-    /// retry after some time passes. For early blocks in old testnets it can also mean that the
-    /// batch is legacy and the node does not index it anymore.
-    #[error(
-        "L1 batch containing the transaction has not been finalized or indexed by this node yet"
-    )]
-    BatchNotAvailableYet,
     /// Historical block could not be found on this node (e.g., pruned).
     #[error("historical block {0} is not available")]
     BlockNotAvailable(BlockNumber),

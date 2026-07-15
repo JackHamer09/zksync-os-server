@@ -3,6 +3,7 @@ mod call_fees;
 mod config;
 
 pub use config::{RateLimits, RpcConfig};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -20,9 +21,9 @@ mod simulate;
 pub use rpc_storage::{ReadRpcStorage, RpcStorage};
 mod debug_impl;
 mod imt;
+mod log_proof_utils;
 pub mod js_tracer;
 mod limits;
-mod log_proof_utils;
 mod method_filter_middleware;
 mod monitoring_middleware;
 mod net_impl;
@@ -81,6 +82,7 @@ use zksync_os_types::TransactionAcceptanceState;
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn<RpcStorage: ReadRpcStorage, Mempool: L2Subpool>(
     config: RpcConfig,
+    listener: tokio::net::TcpListener,
     chain_id: u64,
     bridgehub_address: Address,
     bytecode_supplier_address: Address,
@@ -90,13 +92,11 @@ pub async fn spawn<RpcStorage: ReadRpcStorage, Mempool: L2Subpool>(
     acceptance_state: watch::Receiver<TransactionAcceptanceState>,
     last_constructed_block_context: watch::Receiver<Option<BlockContext>>,
     tx_forwarder: Option<TxForwarder>,
-    gateway_provider: Option<DynProvider>,
     l1_provider: DynProvider,
     policy_client: Option<PolicyClient>,
     runtime: &Runtime,
     wait_for_db: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    tracing::info!("Starting JSON-RPC server at {}", config.address);
     metrics::register_task_monitor();
 
     let mut rpc = RpcModule::new(());
@@ -133,7 +133,6 @@ pub async fn spawn<RpcStorage: ReadRpcStorage, Mempool: L2Subpool>(
             storage.clone(),
             genesis_input_source,
             chain_id,
-            gateway_provider,
             l1_provider,
             eth_call_handler.clone(),
         )
@@ -162,9 +161,14 @@ pub async fn spawn<RpcStorage: ReadRpcStorage, Mempool: L2Subpool>(
     let limiter = LoggingLimiter::new(Limiter::new(config.rate_limits.clone().into_limits()));
     let rate_limit_logging = LoggingLimiter::run(limiter.clone());
     let method_filter = Arc::new(config.method_filter.clone());
+    // Snapshot the registered method names so monitoring can bound metric label cardinality:
+    // any other method name (e.g. junk sent to pollute metrics) is collapsed to a single label.
+    let known_methods = Arc::new(rpc.method_names().collect::<HashSet<&'static str>>());
     let rpc_middleware = RpcServiceBuilder::new()
         // Monitoring is outermost so rate-limited responses still appear in error metrics.
-        .layer_fn(move |service| Monitoring::new(service, max_response_size_bytes))
+        .layer_fn(move |service| {
+            Monitoring::new(service, max_response_size_bytes, known_methods.clone())
+        })
         .layer_fn(move |service| MethodFiltering::new(service, method_filter.clone()))
         .layer_fn(move |service| RateLimiting::new(service, limiter.clone()));
 
@@ -180,9 +184,19 @@ pub async fn spawn<RpcStorage: ReadRpcStorage, Mempool: L2Subpool>(
         .set_http_middleware(middleware)
         .set_rpc_middleware(rpc_middleware);
 
+    let local_addr = listener
+        .local_addr()
+        .context("failed to get RPC listener local address")?;
+    tracing::info!(
+        "Starting JSON-RPC server at {local_addr} (configured: {})",
+        config.address
+    );
     let server = server_builder
-        .build(config.address)
-        .await
+        .build_from_tcp(
+            listener
+                .into_std()
+                .context("failed to convert RPC listener to std")?,
+        )
         .context("Failed building HTTP JSON-RPC server")?;
 
     runtime.spawn_critical_with_graceful_shutdown_signal("rpc server", |shutdown| async move {
