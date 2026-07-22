@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.20.13](https://github.com/matter-labs/zksync-os-server/compare/v0.20.12...v0.20.13) (2026-07-22)
+
+
+### Features
+
+* Expose protocol version filtering for prover ([#1480](https://github.com/matter-labs/zksync-os-server/issues/1480)) ([b660c2e](https://github.com/matter-labs/zksync-os-server/commit/b660c2e3e7f1fcccf2912c0fb00b85cf91b7e7e7))
+* **mempool:** validate intrinsic native resources for l2 txs ([#1217](https://github.com/matter-labs/zksync-os-server/issues/1217)) ([e8efe74](https://github.com/matter-labs/zksync-os-server/commit/e8efe74df283cfe58fcb484f2703d1cebb2aeee2))
+* **replay_archive:** native gcs archive support ([#1426](https://github.com/matter-labs/zksync-os-server/issues/1426)) ([2338202](https://github.com/matter-labs/zksync-os-server/commit/233820206e23356f5206fb10c195f9b907f1f5cf))
+
 ## [0.20.12](https://github.com/matter-labs/zksync-os-server/compare/v0.20.11...v0.20.12) (2026-07-20)
 
 
